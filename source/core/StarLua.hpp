@@ -9,6 +9,7 @@
 #include "StarJson.hpp"
 #include "StarRefPtr.hpp"
 #include "StarDirectives.hpp"
+#include "StarLogging.hpp"
 
 namespace Star {
 
@@ -614,6 +615,17 @@ public:
   // Disables null-termination enforcement
   void setNullTerminated(bool nullTerminated);
   void addImGui();
+
+  // Hook management
+  void registerHook(String const& functionPath, bool before, LuaFunction hook);
+  void registerHook(LuaFunction target, bool before, LuaFunction hook);
+  void removeHook(String const& functionPath, LuaFunction hook);
+  void removeHook(LuaFunction target, LuaFunction hook);
+  void clearHooks(String const& functionPath);
+  void clearHooks(LuaFunction target);
+  bool hasHooks(String const& functionPath) const;
+  bool hasHooks(LuaFunction target) const;
+
 private:
   friend struct LuaDetail::LuaHandle;
   friend class LuaReference;
@@ -719,6 +731,28 @@ private:
 
   void updateCountHook();
 
+  // Hook registry: maps function identifier to list of hooks
+  struct FunctionHook {
+    List<LuaFunction> beforeHooks;
+    List<LuaFunction> afterHooks;
+  };
+  HashMap<String, FunctionHook> m_hookRegistry;
+
+  // Registry for function references (light userdata as key)
+  HashMap<void*, FunctionHook> m_functionHookRegistry;
+
+  // Cache of wrapped functions to avoid re-wrapping
+  HashMap<int, int> m_wrappedFunctionCache; // original handle -> wrapped handle
+
+  // Helper methods for hook system
+  static LuaDetail::LuaFunctionReturn callFunctionWithVariadic(LuaEngine* engine, int handleIndex, LuaVariadic<LuaValue> const& args);
+  LuaFunction wrapFunctionWithHooks(String const& identifier, LuaFunction func);
+  void registerHookInternal(String const& functionPath, bool before, LuaFunction hook);
+  void registerHookInternal(LuaFunction target, bool before, LuaFunction hook);
+  LuaDetail::LuaFunctionReturn executeHooks(String const& identifier, LuaFunction func, LuaVariadic<LuaValue> const& args);
+  LuaDetail::LuaFunctionReturn executeHooks(void* funcPtr, LuaFunction func, LuaVariadic<LuaValue> const& args);
+  void wrapPathFunction(String const& path);
+
   // The following fields exist to use their addresses as unique lightuserdata,
   // as is recommended by the lua docs.
   static int s_luaInstructionLimitExceptionKey;
@@ -729,6 +763,7 @@ private:
   int m_scriptDefaultEnvRegistryId;
   int m_wrappedFunctionMetatableRegistryId;
   int m_requireFunctionMetatableRegistryId;
+  int m_hookIdentifierRegistryId;
   HashMap<std::type_index, int> m_registeredUserDataTypes;
 
   lua_State* m_handleThread;
@@ -1843,11 +1878,431 @@ Ret LuaContext::eval(String const& lua) {
   return LuaDetail::FromFunctionReturn<Ret>::convert(engine(), engine().contextEval(handleIndex(), lua));
 }
 
+namespace LuaDetail {
+  // Helper trait to detect if T is a LuaVariadic
+  template <typename T>
+  struct is_lua_variadic : std::false_type {};
+
+  template <typename T>
+  struct is_lua_variadic<LuaVariadic<T>> : std::true_type {};
+
+  // Overload for LuaValue - append directly
+  inline void appendArg(LuaEngine& /*engine*/, LuaVariadic<LuaValue>& variadicArgs, LuaValue const& arg) {
+    variadicArgs.append(arg);
+  }
+
+  // Overload for LuaVariadic<T> - convert each element
+  template <typename T>
+  void appendArg(LuaEngine& engine, LuaVariadic<LuaValue>& variadicArgs, LuaVariadic<T> const& arg) {
+    for (auto const& val : arg)
+      variadicArgs.append(engine.luaFrom(val));
+  }
+
+  // General case - convert and append (only matches if not LuaVariadic and not LuaValue)
+  template <typename T>
+  typename std::enable_if<!is_lua_variadic<std::decay_t<T>>::value && !std::is_same_v<std::decay_t<T>, LuaValue>>::type
+  appendArg(LuaEngine& engine, LuaVariadic<LuaValue>& variadicArgs, T const& arg) {
+    variadicArgs.append(engine.luaFrom(arg));
+  }
+}
+
 template <typename Ret, typename... Args>
 Ret LuaContext::invokePath(String const& key, Args const&... args) const {
   auto p = getPath(key);
-  if (auto f = p.ptr<LuaFunction>())
-    return f->invoke<Ret>(args...);
+  if (auto f = p.ptr<LuaFunction>()) {
+    // Check if hooks are registered for this path
+    bool hasHooks = engine().hasHooks(key);
+    if (key == "init") {
+      Logger::info("invokePath '{}' called (hasHooks={})", key, hasHooks);
+    }
+    if (hasHooks) {
+      Logger::info("invokePath '{}' has hooks, executing with hooks", key);
+
+      // Convert arguments to LuaVariadic<LuaValue> for passing to hooks
+      LuaVariadic<LuaValue> variadicArgs;
+      (LuaDetail::appendArg(engine(), variadicArgs, args), ...);
+
+      // Call original function using the EXACT same path as normal invocation
+      // This preserves execution context (environment, self, etc.)
+      if constexpr (std::is_same_v<Ret, void>) {
+        // Execute before hooks
+        // CRITICAL FIX: Hooks must be called in the SAME execution context/environment as the main function
+        // The main function is called via f->invoke<void>(args...) from LuaContext, which means
+        // it has access to the LuaContext's environment (_ENV upvalue).
+        // Hooks called directly via engine().callFunction() use their own _ENV (possibly global),
+        // which causes C++ callbacks called from hooks to access the wrong environment.
+        // Solution: Temporarily set the hook's _ENV upvalue to match the LuaContext's environment.
+        if (auto hooks = engine().m_hookRegistry.maybe(key)) {
+          // Get this LuaContext's environment handle (LuaContext inherits from LuaTable)
+          int contextEnvHandle = this->handleIndex();
+          
+          // Track current arguments (may be modified by hooks)
+          LuaVariadic<LuaValue> currentArgs = variadicArgs;
+          
+          for (auto const& hook : hooks->beforeHooks) {
+            try {
+              lua_State* state = engine().m_state;
+              lua_checkstack(state, (int)currentArgs.size() + 8);
+              
+              // Push the hook function
+              engine().pushHandle(state, hook.handleIndex());
+              
+              // Get and save the hook's original _ENV upvalue (if it exists)
+              LuaValue originalEnv;
+              bool hadEnv = false;
+              const char* upvalueName = lua_getupvalue(state, -1, 1);
+              if (upvalueName != nullptr) {
+                // Hook has _ENV upvalue - save it
+                originalEnv = engine().popLuaValue(state); // Pop the upvalue, function is now at -1
+                hadEnv = true;
+              }
+              
+              // Now set the hook's _ENV to the context's environment
+              // Function is at -1, push context env
+              engine().pushHandle(state, contextEnvHandle);
+              // Now: -2 = function, -1 = context env
+              const char* setResult = lua_setupvalue(state, -2, 1); // Set _ENV upvalue
+              // After set: -1 = function (upvalue was popped)
+              
+              if (setResult == nullptr && hadEnv) {
+                // Failed to set upvalue even though we had one - this shouldn't happen
+                // Push the original env back and continue
+                engine().pushLuaValue(state, originalEnv);
+                lua_setupvalue(state, -2, 1);
+                Logger::warn("Failed to set _ENV upvalue for hook, using original");
+              }
+              
+              // Push arguments for the hook
+              for (auto const& arg : currentArgs)
+                engine().pushLuaValue(state, arg);
+              
+              // Now call the hook with arguments - it should use the context's environment
+              int stackSizeBefore = lua_gettop(state) - (int)currentArgs.size() - 1; // -1 for function
+              engine().incrementRecursionLevel();
+              int res = engine().pcallWithTraceback(state, (int)currentArgs.size(), LUA_MULTRET);
+              engine().decrementRecursionLevel();
+              
+              // Restore the hook's original _ENV upvalue AFTER the call
+              if (hadEnv && setResult != nullptr) {
+                // Push the hook function again to restore its upvalue
+                engine().pushHandle(state, hook.handleIndex());
+                engine().pushLuaValue(state, originalEnv);
+                lua_setupvalue(state, -2, 1);
+                lua_pop(state, 1); // Pop the function
+              }
+              
+              if (res != LUA_OK) {
+                engine().handleError(state, res);
+              } else {
+                // Check if hook returned modified arguments (argument chaining)
+                int stackSizeAfter = lua_gettop(state);
+                int returnValues = stackSizeAfter - stackSizeBefore;
+                if (returnValues > 0) {
+                  // Hook returned values - use them as new arguments for next hook/function
+                  LuaVariadic<LuaValue> newArgs(returnValues);
+                  for (int i = returnValues - 1; i >= 0; --i)
+                    newArgs[i] = engine().popLuaValue(state);
+                  currentArgs = newArgs;
+                } else {
+                  // Hook returned nothing - keep current arguments
+                }
+              }
+            } catch (std::exception const& e) {
+              Logger::error("Error executing before hook for '{}': {}", key, e.what());
+            } catch (...) {
+              Logger::error("Unknown error executing before hook for '{}'", key);
+            }
+          }
+          
+          // Convert modified arguments back to original types and call main function
+          // For now, we'll just call with original args since argument type conversion
+          // from LuaVariadic back to template args is complex. TODO: Implement proper conversion.
+          f->invoke<void>(args...);
+        } else {
+          // No hooks, call normally
+          f->invoke<void>(args...);
+        }
+        
+        // Execute after hooks (for void functions, hooks only get original args)
+        if (auto hooks = engine().m_hookRegistry.maybe(key)) {
+          int contextEnvHandle = this->handleIndex();
+          for (auto const& hook : hooks->afterHooks) {
+            try {
+              lua_State* state = engine().m_state;
+              lua_checkstack(state, (int)variadicArgs.size() + 8);
+              
+              // Push the hook function
+              engine().pushHandle(state, hook.handleIndex());
+              
+              // Set hook's _ENV to context's environment
+              LuaValue originalEnv;
+              bool hadEnv = false;
+              const char* upvalueName = lua_getupvalue(state, -1, 1);
+              if (upvalueName != nullptr) {
+                originalEnv = engine().popLuaValue(state);
+                hadEnv = true;
+              }
+              engine().pushHandle(state, contextEnvHandle);
+              const char* setResult = lua_setupvalue(state, -2, 1);
+              
+              // Push original args
+              for (auto const& arg : variadicArgs)
+                engine().pushLuaValue(state, arg);
+              
+              int stackSizeBefore = lua_gettop(state) - (int)variadicArgs.size() - 1;
+              engine().incrementRecursionLevel();
+              int res = engine().pcallWithTraceback(state, (int)variadicArgs.size(), LUA_MULTRET);
+              engine().decrementRecursionLevel();
+              
+              // Restore _ENV
+              if (hadEnv && setResult != nullptr) {
+                engine().pushHandle(state, hook.handleIndex());
+                engine().pushLuaValue(state, originalEnv);
+                lua_setupvalue(state, -2, 1);
+                lua_pop(state, 1);
+              }
+              
+              if (res != LUA_OK) {
+                engine().handleError(state, res);
+              } else {
+                // Clean up return values (after hooks for void functions can't modify anything)
+                int stackSizeAfter = lua_gettop(state);
+                int returnValues = stackSizeAfter - stackSizeBefore;
+                if (returnValues > 0) {
+                  lua_pop(state, returnValues);
+                }
+              }
+            } catch (std::exception const& e) {
+              Logger::error("Error executing after hook for '{}': {}", key, e.what());
+            } catch (...) {
+              Logger::error("Unknown error executing after hook for '{}'", key);
+            }
+          }
+        }
+        
+        return;
+        
+        // TEMPORARILY DISABLED: Execute after hooks (for void functions, hooks get no return value)
+        // if (auto hooks = engine().m_hookRegistry.maybe(key)) {
+        //   for (auto const& hook : hooks->afterHooks) {
+        //     try {
+        //       // For void functions, after hooks only get original args
+        //       LuaVariadic<LuaValue> afterArgs;
+        //       for (auto const& arg : variadicArgs)
+        //         afterArgs.append(arg);
+        //
+        //       if (afterArgs.empty()) {
+        //         engine().callFunction(hook.handleIndex());
+        //       } else {
+        //         auto hookResult = LuaEngine::callFunctionWithVariadic(&engine(), hook.handleIndex(), afterArgs);
+        //         (void)hookResult; // Ignore return value for void functions
+        //       }
+        //     } catch (std::exception const& e) {
+        //       Logger::error("Error executing after hook for '{}': {}", key, e.what());
+        //     } catch (...) {
+        //       Logger::error("Unknown error executing after hook for '{}'", key);
+        //     }
+        //   }
+        // }
+      } else {
+        // Non-void return type - hooks can modify both arguments and return values
+        if (auto hooks = engine().m_hookRegistry.maybe(key)) {
+          int contextEnvHandle = this->handleIndex();
+          LuaVariadic<LuaValue> currentArgs = variadicArgs;
+          
+          // Execute before hooks (can modify arguments)
+          for (auto const& hook : hooks->beforeHooks) {
+            try {
+              lua_State* state = engine().m_state;
+              lua_checkstack(state, (int)currentArgs.size() + 8);
+              
+              engine().pushHandle(state, hook.handleIndex());
+              
+              // Set hook's _ENV
+              LuaValue originalEnv;
+              bool hadEnv = false;
+              const char* upvalueName = lua_getupvalue(state, -1, 1);
+              if (upvalueName != nullptr) {
+                originalEnv = engine().popLuaValue(state);
+                hadEnv = true;
+              }
+              engine().pushHandle(state, contextEnvHandle);
+              const char* setResult = lua_setupvalue(state, -2, 1);
+              
+              // Push arguments
+              for (auto const& arg : currentArgs)
+                engine().pushLuaValue(state, arg);
+              
+              int stackSizeBefore = lua_gettop(state) - (int)currentArgs.size() - 1;
+              engine().incrementRecursionLevel();
+              int res = engine().pcallWithTraceback(state, (int)currentArgs.size(), LUA_MULTRET);
+              engine().decrementRecursionLevel();
+              
+              // Restore _ENV
+              if (hadEnv && setResult != nullptr) {
+                engine().pushHandle(state, hook.handleIndex());
+                engine().pushLuaValue(state, originalEnv);
+                lua_setupvalue(state, -2, 1);
+                lua_pop(state, 1);
+              }
+              
+              if (res != LUA_OK) {
+                engine().handleError(state, res);
+              } else {
+                // Check for modified arguments
+                int stackSizeAfter = lua_gettop(state);
+                int returnValues = stackSizeAfter - stackSizeBefore;
+                if (returnValues > 0) {
+                  LuaVariadic<LuaValue> newArgs(returnValues);
+                  for (int i = returnValues - 1; i >= 0; --i)
+                    newArgs[i] = engine().popLuaValue(state);
+                  currentArgs = newArgs;
+                }
+              }
+            } catch (std::exception const& e) {
+              Logger::error("Error executing before hook for '{}': {}", key, e.what());
+            } catch (...) {
+              Logger::error("Unknown error executing before hook for '{}'", key);
+            }
+          }
+          
+          // Call main function with (possibly modified) arguments
+          // For now, use original args since type conversion is complex. TODO: Implement proper conversion.
+          Ret result = f->invoke<Ret>(args...);
+          
+          // Convert result to LuaValue for passing to after hooks
+          LuaValue resultValue = engine().luaFrom(result);
+          
+          // Execute after hooks (can modify return value)
+          for (auto const& hook : hooks->afterHooks) {
+            try {
+              lua_State* state = engine().m_state;
+              lua_checkstack(state, (int)variadicArgs.size() + 8);
+              
+              engine().pushHandle(state, hook.handleIndex());
+              
+              // Set hook's _ENV
+              LuaValue originalEnv;
+              bool hadEnv = false;
+              const char* upvalueName = lua_getupvalue(state, -1, 1);
+              if (upvalueName != nullptr) {
+                originalEnv = engine().popLuaValue(state);
+                hadEnv = true;
+              }
+              engine().pushHandle(state, contextEnvHandle);
+              const char* setResult = lua_setupvalue(state, -2, 1);
+              
+              // Push return value first, then original args
+              engine().pushLuaValue(state, resultValue);
+              for (auto const& arg : variadicArgs)
+                engine().pushLuaValue(state, arg);
+              
+              int stackSizeBefore = lua_gettop(state) - (int)variadicArgs.size() - 1 - 1; // -1 for result, -1 for function
+              engine().incrementRecursionLevel();
+              int res = engine().pcallWithTraceback(state, (int)variadicArgs.size() + 1, LUA_MULTRET);
+              engine().decrementRecursionLevel();
+              
+              // Restore _ENV
+              if (hadEnv && setResult != nullptr) {
+                engine().pushHandle(state, hook.handleIndex());
+                engine().pushLuaValue(state, originalEnv);
+                lua_setupvalue(state, -2, 1);
+                lua_pop(state, 1);
+              }
+              
+              if (res != LUA_OK) {
+                engine().handleError(state, res);
+              } else {
+                // Check if hook returned a modified return value
+                int stackSizeAfter = lua_gettop(state);
+                int returnValues = stackSizeAfter - stackSizeBefore;
+                if (returnValues > 0) {
+                  // Hook returned a value - use it as the new result
+                  LuaValue newResult = engine().popLuaValue(state);
+                  if (newResult != LuaNil) {
+                    resultValue = newResult;
+                    // Convert back to Ret type
+                    result = engine().luaTo<Ret>(resultValue);
+                  }
+                  // Clean up any extra return values
+                  if (returnValues > 1) {
+                    lua_pop(state, returnValues - 1);
+                  }
+                }
+              }
+            } catch (std::exception const& e) {
+              Logger::error("Error executing after hook for '{}': {}", key, e.what());
+            } catch (...) {
+              Logger::error("Unknown error executing after hook for '{}'", key);
+            }
+          }
+          
+          return result;
+        } else {
+          // No hooks, call normally
+          return f->invoke<Ret>(args...);
+        }
+        
+        /*
+        // OLD CODE - keeping for reference
+        // Call function directly to get LuaFunctionReturn (same as invoke does internally)
+        // This allows us to pass the result to hooks without conversion issues
+        auto funcResult = engine().callFunction(f->handleIndex(), args...);
+
+        // Execute after hooks (for non-void functions, hooks can modify return value)
+        if (auto hooks = engine().m_hookRegistry.maybe(key)) {
+          // Check if original function returned a value (not void)
+          bool hasReturnValue = funcResult.template ptr<LuaValue>() != nullptr || funcResult.template ptr<LuaVariadic<LuaValue>>() != nullptr;
+
+          for (auto const& hook : hooks->afterHooks) {
+            try {
+              // Pass result as first argument, then original args
+              LuaVariadic<LuaValue> afterArgs;
+              if (auto vec = funcResult.template ptr<LuaVariadic<LuaValue>>()) {
+                // Multiple return values - append all of them
+                for (auto const& val : *vec)
+                  afterArgs.append(val);
+              } else if (auto val = funcResult.template ptr<LuaValue>()) {
+                // Single return value
+                afterArgs.append(*val);
+              }
+              // Then append original args
+              for (auto const& arg : variadicArgs)
+                afterArgs.append(arg);
+
+              // Call after hook
+              auto hookResult = LuaEngine::callFunctionWithVariadic(&engine(), hook.handleIndex(), afterArgs);
+
+              // Only allow modification if original function had a return value (not void)
+              if (hasReturnValue) {
+                // If hook returns a value, use it as the new result (allowing modification)
+                if (auto val = hookResult.ptr<LuaValue>()) {
+                  if (*val != LuaNil) {
+                    funcResult = hookResult;
+                  }
+                } else if (auto vec = hookResult.ptr<LuaVariadic<LuaValue>>()) {
+                  if (!vec->empty()) {
+                    funcResult = LuaDetail::LuaFunctionReturn(vec->at(0));
+                  }
+                }
+              }
+            } catch (std::exception const& e) {
+              Logger::error("Error executing after hook for '{}': {}", key, e.what());
+            } catch (...) {
+              Logger::error("Unknown error executing after hook for '{}'", key);
+            }
+          }
+        }
+
+        // Convert result to requested type (same as invoke does)
+        // return LuaDetail::FromFunctionReturn<Ret>::convert(engine(), funcResult);
+        */
+      }
+    } else {
+      // No hooks, call directly
+      return f->invoke<Ret>(args...);
+    }
+  }
   throw LuaException::format("invokePath called on path '{}' which is not function type", key);
 }
 
