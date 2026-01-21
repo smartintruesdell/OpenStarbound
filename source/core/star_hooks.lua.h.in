@@ -1,0 +1,4 @@
+// Auto-generated from star_hooks.lua - DO NOT EDIT MANUALLY
+// Lua-side hook registry and wrapper builder. This runs once per context to
+// define the `hooks` global and keep wrapping purely in Lua.
+char const* HooksLibrarySource = R"HOOKS(@STAR_HOOKS_LUA_CONTENT@)HOOKS";
