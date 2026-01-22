@@ -1,4 +1,5 @@
 #include "StarLuaRoot.hpp"
+#include "StarLuaPlugins.hpp"
 #include "StarAssets.hpp"
 
 namespace Star {
@@ -95,6 +96,11 @@ LuaContext LuaRoot::createContext(String const& script) {
 LuaContext LuaRoot::createContext(StringList const& scriptPaths) {
   auto newContext = m_luaEngine->createContext();
 
+  // Apply callbacks BEFORE setting up require function and loading scripts
+  // This ensures callbacks are available when scripts load and when plugins load via require
+  for (auto const& callbackPair : m_luaCallbacks)
+    newContext.setCallbacks(callbackPair.first, callbackPair.second);
+
   auto cache = m_scriptCache;
   newContext.setRequireFunction([cache](LuaContext& context, LuaString const& module) {
     if (!context.get("_SBLOADED").is<LuaTable>())
@@ -114,9 +120,6 @@ LuaContext LuaRoot::createContext(StringList const& scriptPaths) {
     else
       Logger::error("Script '{}' does not exist", scriptPath);
   }
-
-  for (auto const& callbackPair : m_luaCallbacks)
-    newContext.setCallbacks(callbackPair.first, callbackPair.second);
 
   return newContext;
 }
@@ -181,7 +184,27 @@ void LuaRoot::ScriptCache::loadContextScript(LuaContext& context, String const& 
   RecursiveMutexLocker locker(mutex);
   if (!scriptLoaded(assetPath))
     loadScript(context.engine(), assetPath);
-  context.load(scripts.get(assetPath));
+
+  // Load plugins BEFORE the main script. This ordering ensures plugins are loaded
+  // and can execute their code before the main script runs.
+  // Callbacks (sb, root) are already applied by createContext() before this point.
+  Logger::debug("loadContextScript: Loading plugins for '{}'", assetPath);
+  LuaPlugins::loadPluginsForScript(context, assetPath);
+  Logger::debug("loadContextScript: Finished loading plugins for '{}'", assetPath);
+
+  // Load the main script after plugins have been loaded
+  // Wrap in try-catch to ensure errors don't break the execution context
+  Logger::debug("loadContextScript: Loading main script '{}'", assetPath);
+  try {
+    context.load(scripts.get(assetPath));
+    Logger::debug("loadContextScript: Successfully loaded main script '{}'", assetPath);
+  } catch (LuaException const& e) {
+    Logger::error("LuaException while loading main script '{}' after plugins: {}", assetPath, e.what());
+    throw; // Re-throw to maintain existing error behavior
+  } catch (std::exception const& e) {
+    Logger::error("Exception while loading main script '{}' after plugins: {}", assetPath, e.what());
+    throw; // Re-throw to maintain existing error behavior
+  }
 }
 
 size_t LuaRoot::ScriptCache::memoryUsage() const {
