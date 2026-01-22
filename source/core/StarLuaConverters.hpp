@@ -55,6 +55,107 @@ struct LuaConverter<pair<T1, T2>> {
   }
 };
 
+// Converter for LuaTupleReturn - converts between C++ tuples and Lua tables.
+// 
+// Edge case behavior:
+// - Extra table elements beyond the tuple size are ignored (only indices 1..N are read)
+// - Missing required elements cause conversion to fail (returns empty Maybe)
+// - Non-sequential indices: only sequential indices starting at 1 are read
+// - If a single value is provided (not a table), only the first tuple element is populated,
+//   remaining elements are set to LuaNil (which may convert to default values)
+template <typename... Types>
+struct LuaConverter<LuaTupleReturn<Types...>> {
+  template <size_t... Indexes>
+  static LuaValue toTable(LuaEngine& engine, LuaTupleReturn<Types...> const& tuple, IndexSequence<Indexes...> const&) {
+    auto table = engine.createTable(sizeof...(Types), 0);
+    using expander = int[];
+    (void)expander{0, (table.set(Indexes + 1, engine.luaFrom(std::get<Indexes>(tuple))), 0)...};
+    return table;
+  }
+
+  static LuaValue from(LuaEngine& engine, LuaTupleReturn<Types...> const& tuple) {
+    return toTable(engine, tuple, typename GenIndexSequence<0, sizeof...(Types)>::type());
+  }
+
+  static LuaValue from(LuaEngine& engine, LuaTupleReturn<Types...>&& tuple) {
+    return toTable(engine, tuple, typename GenIndexSequence<0, sizeof...(Types)>::type());
+  }
+
+  template <size_t... Indexes>
+  static Maybe<LuaTupleReturn<Types...>> fromTable(LuaEngine& engine, LuaTable const& table, IndexSequence<Indexes...> const&) {
+    try {
+      // Only reads sequential indices 1, 2, ..., N. Extra elements are ignored.
+      return LuaTupleReturn<Types...>(engine.luaTo<Types>(table.get(Indexes + 1))...);
+    } catch (LuaException const&) {
+      // Conversion failed - return empty Maybe
+      return {};
+    }
+  }
+
+  template <size_t... Indexes>
+  static Maybe<LuaTupleReturn<Types...>> fromSingle(LuaEngine& engine, LuaValue const& v, IndexSequence<Indexes...> const&) {
+    try {
+      // Single value: first element gets the value, rest get LuaNil
+      return LuaTupleReturn<Types...>(engine.luaTo<Types>(Indexes == 0 ? v : LuaNil)...);
+    } catch (LuaException const&) {
+      return {};
+    }
+  }
+
+  static Maybe<LuaTupleReturn<Types...>> to(LuaEngine& engine, LuaValue const& v) {
+    auto indexes = typename GenIndexSequence<0, sizeof...(Types)>::type();
+    if (auto table = v.ptr<LuaTable>())
+      return fromTable(engine, *table, indexes);
+    if (v == LuaNil)
+      return fromSingle(engine, LuaNil, indexes);
+    return fromSingle(engine, v, indexes);
+  }
+};
+
+// Convert LuaVariadic values by treating them as simple Lua arrays.
+//
+// Edge case behavior:
+// - Empty tables convert to empty LuaVariadic (no elements)
+// - Non-sequential indices: only sequential indices starting at 1 are read (stops at first gap)
+// - Mixed types: if T is a variant type, each element is converted individually
+// - Single value: if not a table, converts to 1-element variadic if value is convertible to T
+// - Conversion failure: if any element fails to convert, entire conversion fails (returns empty Maybe)
+template <typename T>
+struct LuaConverter<LuaVariadic<T>> {
+  static LuaValue from(LuaEngine& engine, LuaVariadic<T> const& variadic) {
+    auto table = engine.createTable(variadic.size(), 0);
+    size_t i = 1;
+    for (auto const& v : variadic)
+      table.set(i++, engine.luaFrom(v));
+    return table;
+  }
+
+  static Maybe<LuaVariadic<T>> to(LuaEngine& engine, LuaValue const& v) {
+    LuaVariadic<T> result;
+
+    // If it's a table, treat sequential numeric keys as an array.
+    // Stops at first missing index (non-sequential indices are ignored).
+    if (auto table = v.ptr<LuaTable>()) {
+      for (size_t i = 1; table->contains(i); ++i) {
+        auto converted = engine.luaMaybeTo<T>(table->get(i));
+        if (!converted)
+          // Any conversion failure causes entire conversion to fail
+          return {};
+        result.append(converted.take());
+      }
+      return result;
+    }
+
+    // Fallback: a single value convertible to T forms a 1-element variadic.
+    if (auto single = engine.luaMaybeTo<T>(v)) {
+      result.append(single.take());
+      return result;
+    }
+
+    return {};
+  }
+};
+
 template <typename T, size_t N>
 struct LuaConverter<Vector<T, N>> {
   static LuaValue from(LuaEngine& engine, Vector<T, N> const& v) {

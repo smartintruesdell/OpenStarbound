@@ -9,6 +9,7 @@
 #include "StarJson.hpp"
 #include "StarRefPtr.hpp"
 #include "StarDirectives.hpp"
+#include "StarLogging.hpp"
 
 namespace Star {
 
@@ -614,6 +615,7 @@ public:
   // Disables null-termination enforcement
   void setNullTerminated(bool nullTerminated);
   void addImGui();
+
 private:
   friend struct LuaDetail::LuaHandle;
   friend class LuaReference;
@@ -1843,11 +1845,40 @@ Ret LuaContext::eval(String const& lua) {
   return LuaDetail::FromFunctionReturn<Ret>::convert(engine(), engine().contextEval(handleIndex(), lua));
 }
 
+namespace LuaDetail {
+  // Helper trait to detect if T is a LuaVariadic
+  template <typename T>
+  struct is_lua_variadic : std::false_type {};
+
+  template <typename T>
+  struct is_lua_variadic<LuaVariadic<T>> : std::true_type {};
+
+  // Overload for LuaValue - append directly
+  inline void appendArg(LuaEngine& /*engine*/, LuaVariadic<LuaValue>& variadicArgs, LuaValue const& arg) {
+    variadicArgs.append(arg);
+  }
+
+  // Overload for LuaVariadic<T> - convert each element
+  template <typename T>
+  void appendArg(LuaEngine& engine, LuaVariadic<LuaValue>& variadicArgs, LuaVariadic<T> const& arg) {
+    for (auto const& val : arg)
+      variadicArgs.append(engine.luaFrom(val));
+  }
+
+  // General case - convert and append (only matches if not LuaVariadic and not LuaValue)
+  template <typename T>
+  typename std::enable_if<!is_lua_variadic<std::decay_t<T>>::value && !std::is_same_v<std::decay_t<T>, LuaValue>>::type
+  appendArg(LuaEngine& engine, LuaVariadic<LuaValue>& variadicArgs, T const& arg) {
+    variadicArgs.append(engine.luaFrom(arg));
+  }
+}
+
 template <typename Ret, typename... Args>
 Ret LuaContext::invokePath(String const& key, Args const&... args) const {
   auto p = getPath(key);
-  if (auto f = p.ptr<LuaFunction>())
+  if (auto f = p.ptr<LuaFunction>()) {
     return f->invoke<Ret>(args...);
+  }
   throw LuaException::format("invokePath called on path '{}' which is not function type", key);
 }
 
