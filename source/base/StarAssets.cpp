@@ -293,16 +293,30 @@ Assets::Assets(Settings settings, StringList assetSources) {
   auto addSource = [&](String const& sourcePath, AssetSourcePtr source) {
     m_assetSourcePaths.add(sourcePath, source);
 
+    // Helper function to register a patch on a base file, creating entry if needed
+    auto registerPatchOnBaseFile = [&](String const& targetPatchFile, String const& patchFilename) {
+      auto baseFilePtr = m_files.ptr(targetPatchFile);
+      if (!baseFilePtr) {
+        // Base file doesn't exist yet - create entry for it
+        auto& baseFile = m_files[targetPatchFile];
+        baseFile.sourceName = targetPatchFile;
+        baseFile.patchSources.append({patchFilename, source});
+      } else {
+        // Base file exists - just add patch
+        baseFilePtr->patchSources.append({patchFilename, source});
+      }
+    };
+
+    constexpr int MaxPatchSuffixNumber = 10;
+
     for (auto const& filename : source->assetPaths()) {
       if (filename.contains(AssetsPatchSuffix, String::CaseInsensitive)) {
         if (filename.endsWith(AssetsPatchSuffix, String::CaseInsensitive)) {
           auto targetPatchFile = filename.substr(0, filename.size() - strlen(AssetsPatchSuffix));
-          if (auto p = m_files.ptr(targetPatchFile))
-            p->patchSources.append({filename, source});
+          registerPatchOnBaseFile(targetPatchFile, filename);
         } else if (filename.endsWith(AssetsLuaPatchSuffix, String::CaseInsensitive)) {
           auto targetPatchFile = filename.substr(0, filename.size() - strlen(AssetsLuaPatchSuffix));
-          if (auto p = m_files.ptr(targetPatchFile))
-            p->patchSources.append({filename, source});
+          registerPatchOnBaseFile(targetPatchFile, filename);
         } else if (filename.endsWith(AssetsPatchListSuffix, String::CaseInsensitive)) {
           auto stream = source->read(filename);
           size_t patchIndex = 0;
@@ -322,11 +336,10 @@ Assets::Assets(Settings settings, StringList assetSources) {
             patchIndex++;
           }
         } else {
-          for (int i = 0; i < 10; i++) {
+          for (int i = 0; i < MaxPatchSuffixNumber; i++) {
             if (filename.endsWith(AssetsPatchSuffix + toString(i), String::CaseInsensitive)) {
               auto targetPatchFile = filename.substr(0, filename.size() - strlen(AssetsPatchSuffix) + 1);
-              if (auto p = m_files.ptr(targetPatchFile))
-                p->patchSources.append({filename, source});
+              registerPatchOnBaseFile(targetPatchFile, filename);
               break;
             }
           }
@@ -406,7 +419,10 @@ Assets::Assets(Settings settings, StringList assetSources) {
 
     if (digestFile) {
       digest.push(assetPath);
-      digest.push(DataStreamBuffer::serialize(descriptor.source->open(descriptor.sourceName)->size()));
+      // Only include source file in digest if it exists (source may be nullptr for patch-only entries)
+      if (descriptor.source) {
+        digest.push(DataStreamBuffer::serialize(descriptor.source->open(descriptor.sourceName)->size()));
+      }
       for (auto const& pair : descriptor.patchSources)
         digest.push(DataStreamBuffer::serialize(pair.second->open(AssetPath::removeSubPath(pair.first))->size()));
     }
@@ -1002,14 +1018,20 @@ FramesSpecificationConstPtr Assets::bestFramesSpecification(String const& image)
 }
 
 IODevicePtr Assets::open(String const& path) const {
-  if (auto p = m_files.ptr(path))
+  if (auto p = m_files.ptr(path)) {
+    if (!p->source)
+      throw AssetException(strf("Asset '{}' has no source (patch-only entry)", path));
     return p->source->open(p->sourceName);
+  }
   throw AssetException(strf("No such asset '{}'", path));
 }
 
 ByteArray Assets::read(String const& path) const {
-  if (auto p = m_files.ptr(path))
+  if (auto p = m_files.ptr(path)) {
+    if (!p->source)
+      throw AssetException(strf("Asset '{}' has no source (patch-only entry)", path));
     return p->source->read(p->sourceName);
+  }
   throw AssetException(strf("No such asset '{}'", path));
 }
 
@@ -1097,10 +1119,81 @@ Json Assets::checkPatchArray(String const& path, AssetSourcePtr const& source, J
   return newResult;
 }
 
+// Reads a JSON file, applying any patches found.
+//
+// Behavior change: Previously, this function would throw AssetException if the base file
+// didn't exist. Now, if patches exist but the base file doesn't, it infers the JSON type
+// from the patches (defaulting to JsonObject) and applies patches to an empty base.
+// This allows patch-only JSON files (files that only have .patch files, no base file).
+//
+// Migration: Code that relied on readJson throwing for missing files may need to check
+// assetExists() first if that behavior is required.
 Json Assets::readJson(String const& path) const {
-  ByteArray streamData = read(path);
+  Json baseJson;
+  List<pair<String, AssetSourcePtr>> patchSources;
+
+  // Check if file entry exists (may have been created for patches even if base file doesn't exist)
+  if (auto filePtr = m_files.ptr(path)) {
+    patchSources = filePtr->patchSources;
+    // Try to read the base file
+    try {
+      ByteArray streamData = read(path);
+      baseJson = inputUtf8Json(streamData.begin(), streamData.end(), JsonParseType::Top);
+    } catch (AssetException const&) {
+      // Base file doesn't exist, but we have an entry (likely created for patches)
+      // Try to infer the expected type from the first patch, default to object
+      if (!patchSources.empty()) {
+        try {
+          auto& firstPatch = patchSources[0];
+          auto patchAssetPath = AssetPath::split(firstPatch.first);
+          auto patchStream = firstPatch.second->read(patchAssetPath.basePath);
+          if (!patchAssetPath.basePath.endsWith(".lua")) {
+            auto patchJson = inputUtf8Json(patchStream.begin(), patchStream.end(), JsonParseType::Top);
+            if (patchAssetPath.subPath)
+              patchJson = patchJson.query(*patchAssetPath.subPath);
+            // If first patch is an array of operations, infer from operation type
+            if (patchJson.isType(Json::Type::Array) && !patchJson.toArray().empty()) {
+              auto firstOp = patchJson.toArray()[0];
+              if (firstOp.isType(Json::Type::Object)) {
+                auto opObj = firstOp.toObject();
+                // Check if operation suggests array (e.g., "op": "add", "path": "/-")
+                if (auto path = opObj.maybe("path")) {
+                  if (path->toString().endsWith("/-")) {
+                    baseJson = JsonArray{};
+                  } else {
+                    baseJson = JsonObject{};
+                  }
+                } else {
+                  baseJson = JsonObject{};
+                }
+              } else {
+                baseJson = JsonObject{};
+              }
+            } else if (patchJson.isType(Json::Type::Object)) {
+              // Merge patch suggests object type
+              baseJson = JsonObject{};
+            } else {
+              baseJson = JsonObject{};
+            }
+          } else {
+            // Lua patch - default to object
+            baseJson = JsonObject{};
+          }
+        } catch (...) {
+          // If we can't parse the patch, default to object
+          baseJson = JsonObject{};
+        }
+      } else {
+        // No patches - default to object (most JSON files are objects)
+        baseJson = JsonObject{};
+      }
+    }
+  } else {
+    throw AssetException(strf("No such asset '{}'", path));
+  }
+
   try {
-    return applyJsonPatches(inputUtf8Json(streamData.begin(), streamData.end(), JsonParseType::Top), path, m_files.get(path).patchSources);
+    return applyJsonPatches(baseJson, path, patchSources);
   } catch (std::exception const& e) {
     throw JsonParsingException(strf("Cannot parse json file: {}", path), e);
   }
